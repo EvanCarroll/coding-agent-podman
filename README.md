@@ -41,6 +41,18 @@ curl --proto '=https' --tlsv1.2 -sSf \
 sudo chmod a+x /usr/local/bin/codex-podman
 ```
 
+Or, from a clone of this repository, install both at once:
+
+```sh
+make
+```
+
+`make` copies `bin/claude` and `bin/codex` to `/usr/local/bin/claude-podman` and
+`/usr/local/bin/codex-podman` — the same names the curl commands above use, so
+the two methods are interchangeable. `make install-claude` / `make install-codex`
+install just one, `make uninstall` removes them, and `PREFIX` or `BINDIR` retarget
+the destination (`make PREFIX=$HOME/.local SUDO=` needs no root).
+
 Now just run `claude-podman` or `codex-podman` from the directory you want the
 agent to work in. Later, `claude-podman --self-update` / `codex-podman --self-update`
 refreshes the launcher itself.
@@ -73,16 +85,24 @@ Signing in
 **Claude Code** stores its credentials in `$HOME/.claude.json` and
 `$HOME/.claude`, both of which are mounted, so signing in once persists.
 
-**Codex** is slightly awkward the first time. `codex login` completes an OAuth
-handshake against `localhost:1455`, and that callback can't reach your host
-browser from inside a rootless container. Two ways around it:
+**Codex** is slightly awkward the first time. `codex login` starts a server on
+`localhost:1455` and waits for your browser to deliver an OAuth callback to it.
+Because codex binds that server to the container's loopback address, publishing
+the port alone is not enough — pasta hands inbound connections to the
+container's public address, so the browser gets a connection reset. Three ways
+around it:
 
 ```sh
 # Option 1 (simplest): log in once on the host. The token lands in
 # ~/.codex/auth.json, which the container mounts.
 codex login
 
-# Option 2: publish the callback port so the containerized login works.
+# Option 2: no callback port at all — codex prints a code to enter in your
+# browser. Good for remote or headless hosts.
+codex-podman login --device-auth
+
+# Option 3: publish the callback port and route it to the container's loopback,
+# which is what --login now does. Requires pasta (podman's default since 5.0).
 codex-podman --login login
 ```
 
@@ -166,7 +186,7 @@ Options
 | `--self-update` | ✓ | ✓ | Replace the installed launcher with the latest from GitHub |
 | `--help` | ✓ | ✓ | Show usage |
 | `--sandboxed` | | ✓ | Keep codex's own sandbox instead of relying on the container |
-| `--login` | | ✓ | Publish port 1455 so `codex login` can call back to your browser |
+| `--login` | | ✓ | Route port 1455 into the container's loopback so `codex login` can receive its browser callback |
 
 Launcher options must come first: the first unrecognized argument, and
 everything after it, is forwarded to the agent itself.

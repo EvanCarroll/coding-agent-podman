@@ -26,8 +26,9 @@ while [[ $# -gt 0 ]]; do
 			  --local              Use local image 'codex:latest' instead of remote
 			  --sandboxed          Keep codex's own sandbox instead of relying on the
 			                       container boundary (often fails under rootless podman)
-			  --login              Publish port 1455 so 'codex login' can complete its
-			                       OAuth callback to your host browser
+			  --login              Make 'codex login' work: publish port 1455 and route
+			                       it to the container's loopback, where codex listens
+			                       (needs pasta; no-port alternative: login --device-auth)
 			  --init-script FILE   Execute initialization script as root in the container
 			  --apk-packages LIST  Install additional Alpine packages (comma or space separated)
 			  --podman-arg ARG     Pass additional argument to podman
@@ -56,6 +57,14 @@ while [[ $# -gt 0 ]]; do
 		shift
 		;;
 	--login)
+		# codex binds its OAuth callback server to 127.0.0.1 inside the
+		# container. Publishing the port is not enough: pasta delivers inbound
+		# connections to the container's public address, which that listener
+		# never sees, so the browser gets a connection reset. --host-lo-to-ns-lo
+		# makes traffic published from the host's loopback arrive on the
+		# container's loopback instead. If pasta is unavailable, skip --login
+		# and run 'codex-podman login --device-auth', which needs no port.
+		PODMAN_ARGS="$PODMAN_ARGS --network=pasta:--host-lo-to-ns-lo"
 		PODMAN_ARGS="$PODMAN_ARGS -p 127.0.0.1:1455:1455"
 		shift
 		;;
