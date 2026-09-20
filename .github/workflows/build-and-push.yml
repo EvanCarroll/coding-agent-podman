@@ -1,4 +1,4 @@
-name: Build and Push Image
+name: Build and Push Images
 
 on:
   push:
@@ -16,30 +16,45 @@ jobs:
       contents: read
       packages: write
 
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [ claude, codex ]
+
+    env:
+      STORAGE_DRIVER: vfs
+
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
 
     - name: Login to GitHub Container Registry
+      if: github.event_name != 'pull_request'
       uses: docker/login-action@v3
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build Image with buildah script
-      env:
-        STORAGE_DRIVER: vfs
+    - name: Build image with buildah script
+      id: build
       run: |
-        # Run the build script
-        VERSION=$(./devops/build-image.sh | tail -n2 | head -n1 | cut -d: -f2)
-        
-        # Tag the image for GHCR
+        # The build scripts print exactly one line on stdout: "<image>:<version>"
+        REF=$(./devops/build-${{ matrix.agent }}.sh)
+        echo "image=${REF%%:*}" >> "$GITHUB_OUTPUT"
+        echo "version=${REF##*:}" >> "$GITHUB_OUTPUT"
+
+    - name: Tag and push to GitHub Container Registry
+      if: github.event_name != 'pull_request'
+      env:
+        IMAGE: ${{ steps.build.outputs.image }}
+        VERSION: ${{ steps.build.outputs.version }}
+      run: |
         REPO_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-        buildah tag claude-code \
-          "ghcr.io/$REPO_NAME/claude-code:$VERSION" \
-          "ghcr.io/$REPO_NAME/claude-code:latest"
-        
-        # Push to GitHub Container Registry
-        buildah push "ghcr.io/$REPO_NAME/claude-code:$VERSION"
-        buildah push "ghcr.io/$REPO_NAME/claude-code:latest"
+
+        buildah tag "$IMAGE" \
+          "ghcr.io/$REPO_NAME/$IMAGE:$VERSION" \
+          "ghcr.io/$REPO_NAME/$IMAGE:latest"
+
+        buildah push "ghcr.io/$REPO_NAME/$IMAGE:$VERSION"
+        buildah push "ghcr.io/$REPO_NAME/$IMAGE:latest"

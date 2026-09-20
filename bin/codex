@@ -1,0 +1,105 @@
+#!/bin/bash
+
+# Default image
+IMAGE="ghcr.io/evancarroll/coding-agent-podman/codex:latest"
+NAME="codex-$(uuidgen -r | cut -d- -f1)"
+INIT_SCRIPT=""
+APK_PACKAGES=""
+PODMAN_ARGS=""
+
+# The container is the security boundary, so codex's own landlock sandbox is
+# off by default -- it is redundant here and frequently fails to initialize
+# under rootless podman. --sandboxed puts it back in charge.
+# The inner quotes are literal: codex parses -c key=value as TOML.
+CODEX_ARGS=(-c 'sandbox_mode="danger-full-access"' -c 'approval_policy="never"')
+
+# Process arguments
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--help)
+		cat <<-'EOT'
+			Usage: codex-podman [OPTIONS] [CODEX ARGS...]
+
+			Run OpenAI Codex in a rootless Podman container
+
+			Options:
+			  --local              Use local image 'codex:latest' instead of remote
+			  --sandboxed          Keep codex's own sandbox instead of relying on the
+			                       container boundary (often fails under rootless podman)
+			  --login              Publish port 1455 so 'codex login' can complete its
+			                       OAuth callback to your host browser
+			  --init-script FILE   Execute initialization script as root in the container
+			  --apk-packages LIST  Install additional Alpine packages (comma or space separated)
+			  --podman-arg ARG     Pass additional argument to podman
+			  --self-update        Replace this launcher with the latest from GitHub
+			  --help               Display this help message
+
+			The first unrecognized argument and everything after it is passed
+			through to codex itself, so launcher options must come first.
+		EOT
+		exit 0
+		;;
+	--self-update)
+		curl --proto '=https' --tlsv1.2 -sSf \
+			https://raw.githubusercontent.com/EvanCarroll/coding-agent-podman/refs/heads/main/bin/codex |
+			sudo tee /usr/local/bin/codex-podman >/dev/null
+		sudo chmod a+x /usr/local/bin/codex-podman
+		echo "Updated"
+		exit 0
+		;;
+	--local)
+		IMAGE="codex:latest"
+		shift
+		;;
+	--sandboxed)
+		CODEX_ARGS=()
+		shift
+		;;
+	--login)
+		PODMAN_ARGS="$PODMAN_ARGS -p 127.0.0.1:1455:1455"
+		shift
+		;;
+	--init-script)
+		INIT_SCRIPT="$2"
+		shift 2
+		;;
+	--apk-packages)
+		APK_PACKAGES="$2"
+		shift 2
+		;;
+	--podman-arg)
+		PODMAN_ARGS="$PODMAN_ARGS $2"
+		shift 2
+		;;
+	*)
+		break
+		;;
+	esac
+done
+
+# Podman would create this as a root-owned directory if it doesn't exist yet.
+mkdir -p "${HOME}/.codex"
+
+podman run \
+	-v "${HOME}/.codex:/home/codex/.codex" \
+	-v "${PWD}:${PWD}" \
+	-w "$PWD" \
+	--rm \
+	--name "$NAME" \
+	-ti \
+	--detach \
+	--user codex \
+	--userns=keep-id:uid=1000,gid=1000 \
+	$PODMAN_ARGS \
+	"$IMAGE" "${CODEX_ARGS[@]}" "$@"
+
+if [ -n "$APK_PACKAGES" ]; then
+	APK_PACKAGES=$(echo $APK_PACKAGES | tr -s ', ' ' ')
+	podman exec --user root:root "$NAME" /bin/zsh -c "apk update; apk add $APK_PACKAGES"
+fi
+if [ -n "$INIT_SCRIPT" ]; then
+	podman cp "$INIT_SCRIPT" "$NAME:/root/init.sh"
+	podman exec --user root:root "$NAME" zsh /root/init.sh
+fi
+
+podman container attach "$NAME"
