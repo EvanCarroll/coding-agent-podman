@@ -1,17 +1,29 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # Default image
 IMAGE="ghcr.io/evancarroll/coding-agent-podman/codex:latest"
+PULL=newer
 NAME="codex-$(uuidgen -r | cut -d- -f1)"
 INIT_SCRIPT=""
 APK_PACKAGES=""
-PODMAN_ARGS=""
+PODMAN_ARGS=()
 
 # The container is the security boundary, so codex's own landlock sandbox is
 # off by default -- it is redundant here and frequently fails to initialize
 # under rootless podman. --sandboxed puts it back in charge.
 # The inner quotes are literal: codex parses -c key=value as TOML.
 CODEX_ARGS=(-c 'sandbox_mode="danger-full-access"' -c 'approval_policy="never"')
+
+die() {
+	printf '%s: %s\n' "${0##*/}" "$*" >&2
+	exit 1
+}
+
+need_arg() {
+	[ "$2" -ge 2 ] || die "$1 requires a value"
+}
 
 # Process arguments
 while [[ $# -gt 0 ]]; do
@@ -31,7 +43,7 @@ while [[ $# -gt 0 ]]; do
 			                       (needs pasta; no-port alternative: login --device-auth)
 			  --init-script FILE   Execute initialization script as root in the container
 			  --apk-packages LIST  Install additional Alpine packages (comma or space separated)
-			  --podman-arg ARG     Pass additional argument to podman
+			  --podman-arg ARG     Pass one additional argument to podman run (repeatable)
 			  --self-update        Replace this launcher with the latest from GitHub
 			  --help               Display this help message
 
@@ -50,6 +62,7 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--local)
 		IMAGE="codex:latest"
+		PULL=never
 		shift
 		;;
 	--sandboxed)
@@ -64,20 +77,23 @@ while [[ $# -gt 0 ]]; do
 		# makes traffic published from the host's loopback arrive on the
 		# container's loopback instead. If pasta is unavailable, skip --login
 		# and run 'codex-podman login --device-auth', which needs no port.
-		PODMAN_ARGS="$PODMAN_ARGS --network=pasta:--host-lo-to-ns-lo"
-		PODMAN_ARGS="$PODMAN_ARGS -p 127.0.0.1:1455:1455"
+		PODMAN_ARGS+=(--network=pasta:--host-lo-to-ns-lo -p 127.0.0.1:1455:1455)
 		shift
 		;;
 	--init-script)
+		need_arg "$1" $#
+		[ -f "$2" ] || die "--init-script: no such file: $2"
 		INIT_SCRIPT="$2"
 		shift 2
 		;;
 	--apk-packages)
+		need_arg "$1" $#
 		APK_PACKAGES="$2"
 		shift 2
 		;;
 	--podman-arg)
-		PODMAN_ARGS="$PODMAN_ARGS $2"
+		need_arg "$1" $#
+		PODMAN_ARGS+=("$2")
 		shift 2
 		;;
 	*)
@@ -86,29 +102,76 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
+command -v podman >/dev/null || die "podman is not installed"
+
 # Podman would create this as a root-owned directory if it doesn't exist yet.
 mkdir -p "${HOME}/.codex"
 
+# The host's git identity and aliases, read-only so the agent can't rewrite
+# them. Credential helpers it names won't exist in the container, which is
+# the point: the agent gets no git credentials.
+[ -f "${HOME}/.gitconfig" ] &&
+	PODMAN_ARGS+=(-v "${HOME}/.gitconfig:/home/codex/.gitconfig:ro")
+GIT_XDG_CONFIG="${XDG_CONFIG_HOME:-${HOME}/.config}/git/config"
+[ -f "$GIT_XDG_CONFIG" ] &&
+	PODMAN_ARGS+=(-v "${GIT_XDG_CONFIG}:/home/codex/.config/git/config:ro")
+
+cleanup() {
+	podman rm -f -t 0 "$NAME" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+# The container idles until setup is done, then codex is exec'd into it, so
+# it never starts before its packages are installed. --init reaps whatever
+# codex's subprocesses leave behind. label=disable keeps SELinux hosts from
+# denying the bind mounts without relabeling your files; elsewhere it's a no-op.
 podman run \
 	-v "${HOME}/.codex:/home/codex/.codex" \
 	-v "${PWD}:${PWD}" \
 	-w "$PWD" \
 	--rm \
-	--name "$NAME" \
-	-ti \
 	--detach \
+	--init \
+	--pull="$PULL" \
+	--tz=local \
+	--security-opt label=disable \
+	--name "$NAME" \
 	--user codex \
 	--userns=keep-id:uid=1000,gid=1000 \
-	$PODMAN_ARGS \
-	"$IMAGE" "${CODEX_ARGS[@]}" "$@"
+	--entrypoint sleep \
+	"${PODMAN_ARGS[@]}" \
+	"$IMAGE" infinity >/dev/null
+
+# Mounting the XDG git config makes podman create ~/.config as root; give it
+# back so codex and its tools can still write there.
+podman exec --user root:root "$NAME" chown codex:codex /home/codex/.config 2>/dev/null || true
 
 if [ -n "$APK_PACKAGES" ]; then
-	APK_PACKAGES=$(echo $APK_PACKAGES | tr -s ', ' ' ')
-	podman exec --user root:root "$NAME" /bin/zsh -c "apk update; apk add $APK_PACKAGES"
+	read -ra PACKAGES <<<"${APK_PACKAGES//,/ }"
+	podman exec --user root:root "$NAME" apk add --no-cache "${PACKAGES[@]}"
 fi
 if [ -n "$INIT_SCRIPT" ]; then
 	podman cp "$INIT_SCRIPT" "$NAME:/root/init.sh"
 	podman exec --user root:root "$NAME" zsh /root/init.sh
 fi
 
-podman container attach "$NAME"
+# -t only with a terminal on both ends, so codex exec works in a pipe. Empty
+# --detach-keys stops podman from swallowing Ctrl-P.
+#
+# It runs in the background so a hangup (terminal or ssh session closed) fires
+# the cleanup trap at once; bash holds traps until a foreground child exits,
+# and podman exec doesn't always get the SIGHUP itself. Without job control a
+# background job's stdin is /dev/null, so the terminal is passed on fd 3.
+TTY=()
+[ -t 0 ] && [ -t 1 ] && TTY=(-t)
+exec 3<&0
+podman exec -i "${TTY[@]}" \
+	--detach-keys= \
+	--user codex \
+	-w "$PWD" \
+	-e TERM -e COLORTERM -e LANG \
+	"$NAME" codex "${CODEX_ARGS[@]}" "$@" <&3 3<&- &
+rc=0
+wait $! || rc=$?
+exit "$rc"

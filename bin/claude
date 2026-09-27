@@ -1,12 +1,26 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # Default image
 IMAGE="ghcr.io/evancarroll/coding-agent-podman/claude-code:latest"
+PULL=newer
 NAME="claudecode-$(uuidgen -r | cut -d- -f1)"
 INIT_SCRIPT=""
 APK_PACKAGES=""
-PODMAN_ARGS=""
+PODMAN_ARGS=()
 LOGIN=""
+LOGIN_DIR=""
+LOGIN_WATCHER=""
+
+die() {
+	printf '%s: %s\n' "${0##*/}" "$*" >&2
+	exit 1
+}
+
+need_arg() {
+	[ "$2" -ge 2 ] || die "$1 requires a value"
+}
 
 # Process arguments
 while [[ $# -gt 0 ]]; do
@@ -24,7 +38,7 @@ while [[ $# -gt 0 ]]; do
 			                       container (needs pasta; without it, paste the code)
 			  --init-script FILE   Execute initialization script as root in the container
 			  --apk-packages LIST  Install additional Alpine packages (comma or space separated)
-			  --podman-arg ARG     Pass additional argument to podman
+			  --podman-arg ARG     Pass one additional argument to podman run (repeatable)
 			  --self-update        Replace this launcher with the latest from GitHub
 			  --help               Display this help message
 
@@ -43,6 +57,7 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--local)
 		IMAGE="claude-code:latest"
+		PULL=never
 		shift
 		;;
 	--login)
@@ -55,19 +70,23 @@ while [[ $# -gt 0 ]]; do
 		# back to 127.0.0.1. "auto" forwards every port the container binds
 		# for the whole session, so only use --login to log in.
 		LOGIN=1
-		PODMAN_ARGS="$PODMAN_ARGS --network=pasta:-4,-t,auto,--host-lo-to-ns-lo"
+		PODMAN_ARGS+=(--network=pasta:-4,-t,auto,--host-lo-to-ns-lo)
 		shift
 		;;
 	--init-script)
+		need_arg "$1" $#
+		[ -f "$2" ] || die "--init-script: no such file: $2"
 		INIT_SCRIPT="$2"
 		shift 2
 		;;
 	--apk-packages)
+		need_arg "$1" $#
 		APK_PACKAGES="$2"
 		shift 2
 		;;
 	--podman-arg)
-		PODMAN_ARGS="$PODMAN_ARGS $2"
+		need_arg "$1" $#
+		PODMAN_ARGS+=("$2")
 		shift 2
 		;;
 	*)
@@ -76,13 +95,34 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
+command -v podman >/dev/null || die "podman is not installed"
+
 # Podman would create these as directories if they don't exist yet, which
 # breaks claude on a fresh machine.
 mkdir -p "${HOME}/.claude"
 [ -e "${HOME}/.claude.json" ] || echo '{}' >"${HOME}/.claude.json"
 
+# The host's git identity and aliases, read-only so the agent can't rewrite
+# them. Credential helpers it names won't exist in the container, which is
+# the point: the agent gets no git credentials.
+[ -f "${HOME}/.gitconfig" ] &&
+	PODMAN_ARGS+=(-v "${HOME}/.gitconfig:/home/claude/.gitconfig:ro")
+GIT_XDG_CONFIG="${XDG_CONFIG_HOME:-${HOME}/.config}/git/config"
+[ -f "$GIT_XDG_CONFIG" ] &&
+	PODMAN_ARGS+=(-v "${GIT_XDG_CONFIG}:/home/claude/.config/git/config:ro")
+
+cleanup() {
+	podman rm -f -t 0 "$NAME" >/dev/null 2>&1 || true
+	[ -z "$LOGIN_WATCHER" ] || kill "$LOGIN_WATCHER" 2>/dev/null || true
+	[ -z "$LOGIN_DIR" ] || rm -rf "$LOGIN_DIR"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
 # There is no browser in the container, so claude's $BROWSER hands the login
-# URL to a file in a shared directory and the host opens it.
+# URL to a file in a shared directory and the host opens it. Only Anthropic's
+# sign-in pages are opened: anything else the container writes there would
+# otherwise reach the host's xdg-open.
 if [ -n "$LOGIN" ]; then
 	LOGIN_DIR=$(mktemp -d)
 	cat >"$LOGIN_DIR/open" <<-'EOT'
@@ -95,37 +135,73 @@ if [ -n "$LOGIN" ]; then
 			[ -s "$LOGIN_DIR/url" ] || continue
 			mv "$LOGIN_DIR/url" "$LOGIN_DIR/url.seen"
 			while read -r url; do
-				xdg-open "$url" >/dev/null 2>&1 ||
-					printf '\nOpen this URL in your browser:\n%s\n' "$url" >&2
+				case "$url" in
+				https://claude.ai/* | https://platform.claude.com/* | https://console.anthropic.com/*)
+					xdg-open "$url" >/dev/null 2>&1 ||
+						printf '\nOpen this URL in your browser:\n%s\n' "$url" >&2
+					;;
+				*)
+					printf '\nIgnoring non-Anthropic URL: %s\n' "$url" >&2
+					;;
+				esac
 			done <"$LOGIN_DIR/url.seen"
 		done
 	) &
 	LOGIN_WATCHER=$!
-	trap 'kill "$LOGIN_WATCHER" 2>/dev/null; rm -rf "$LOGIN_DIR"' EXIT
-	PODMAN_ARGS="$PODMAN_ARGS -v $LOGIN_DIR:/run/claude-login -e BROWSER=/run/claude-login/open"
+	PODMAN_ARGS+=(-v "$LOGIN_DIR:/run/claude-login" -e BROWSER=/run/claude-login/open)
 fi
 
+# The container idles until setup is done, then claude is exec'd into it, so
+# it never starts before its packages are installed. --init reaps whatever
+# claude's subprocesses leave behind. label=disable keeps SELinux hosts from
+# denying the bind mounts without relabeling your files; elsewhere it's a no-op.
 podman run \
 	-v "${HOME}/.claude:/home/claude/.claude" \
 	-v "${HOME}/.claude.json:/home/claude/.claude.json" \
 	-v "${PWD}:${PWD}" \
 	-w "$PWD" \
 	--rm \
-	--name "$NAME" \
-	-ti \
 	--detach \
+	--init \
+	--pull="$PULL" \
+	--tz=local \
+	--security-opt label=disable \
+	--name "$NAME" \
 	--user claude \
 	--userns=keep-id:uid=1001,gid=1001 \
-	$PODMAN_ARGS \
-	"$IMAGE" "$@"
+	--entrypoint sleep \
+	"${PODMAN_ARGS[@]}" \
+	"$IMAGE" infinity >/dev/null
+
+# Mounting the XDG git config makes podman create ~/.config as root; give it
+# back so claude and its tools can still write there.
+podman exec --user root:root "$NAME" chown claude:claude /home/claude/.config 2>/dev/null || true
 
 if [ -n "$APK_PACKAGES" ]; then
-	APK_PACKAGES=$(echo $APK_PACKAGES | tr -s ', ' ' ')
-	podman exec --user root:root "$NAME" /bin/zsh -c "apk update; apk add $APK_PACKAGES"
+	read -ra PACKAGES <<<"${APK_PACKAGES//,/ }"
+	podman exec --user root:root "$NAME" apk add --no-cache "${PACKAGES[@]}"
 fi
 if [ -n "$INIT_SCRIPT" ]; then
 	podman cp "$INIT_SCRIPT" "$NAME:/root/init.sh"
 	podman exec --user root:root "$NAME" zsh /root/init.sh
 fi
 
-podman container attach "$NAME"
+# -t only with a terminal on both ends, so claude -p works in a pipe. Empty
+# --detach-keys stops podman from swallowing Ctrl-P.
+#
+# It runs in the background so a hangup (terminal or ssh session closed) fires
+# the cleanup trap at once; bash holds traps until a foreground child exits,
+# and podman exec doesn't always get the SIGHUP itself. Without job control a
+# background job's stdin is /dev/null, so the terminal is passed on fd 3.
+TTY=()
+[ -t 0 ] && [ -t 1 ] && TTY=(-t)
+exec 3<&0
+podman exec -i "${TTY[@]}" \
+	--detach-keys= \
+	--user claude \
+	-w "$PWD" \
+	-e TERM -e COLORTERM -e LANG \
+	"$NAME" claude "$@" <&3 3<&- &
+rc=0
+wait $! || rc=$?
+exit "$rc"

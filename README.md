@@ -14,8 +14,10 @@ shared between them, and neither image contains anything the agent doesn't need.
 | Claude Code | `claude-podman` | `ghcr.io/evancarroll/coding-agent-podman/claude-code` |
 | Codex | `codex-podman` | `ghcr.io/evancarroll/coding-agent-podman/codex` |
 
-Both images are rebuilt daily against the current upstream release, so `:latest`
-tracks the newest Claude Code / Codex without you updating anything.
+Both images are rebuilt daily against the current upstream release, and the
+launchers check the registry on every start (`--pull=newer`), so you always run
+the newest Claude Code / Codex without updating anything. Offline, they fall
+back to the image you already have.
 
 Installation
 ----
@@ -66,6 +68,7 @@ The agent only gets file access to:
 | --- | --- | --- |
 | Working directory | `$PWD` | `$PWD` |
 | Credentials + config | `$HOME/.claude`, `$HOME/.claude.json` | `$HOME/.codex` |
+| Git config (read-only) | `~/.gitconfig`, `~/.config/git/config` | `~/.gitconfig`, `~/.config/git/config` |
 
 Everything else in your home directory — SSH keys, cloud credentials, browser
 profiles, other projects — is simply not present in the container. The agent can
@@ -75,6 +78,10 @@ Both images run under rootless podman *and* as a non-root user inside the
 container, with `--userns=keep-id` so files the agent creates in `$PWD` come out
 owned by you rather than by root. The agents are locked down hard enough that
 they can't even update themselves.
+
+The git config is there so commits carry your name and aliases work. It's
+mounted read-only, and any credential helpers it names (`gh`, `glab`, …) don't
+exist in the container, so the agent has no git credentials.
 
 Neither image ships `git` — see [Customizing the runtime](#customizing-the-runtime)
 if you want it.
@@ -134,7 +141,7 @@ After either, `~/.codex/auth.json` exists and `codex-podman` just works. An
 `OPENAI_API_KEY` also works if you'd rather not use OAuth at all:
 
 ```sh
-codex-podman --podman-arg "-e OPENAI_API_KEY=$OPENAI_API_KEY"
+codex-podman --podman-arg "--env=OPENAI_API_KEY=$OPENAI_API_KEY"
 ```
 
 Sandboxing
@@ -170,7 +177,7 @@ launchers support the same options.
 ```
 --apk-packages foo,bar,baz # adds packages foo, bar, baz, with apk
 --init-script  ./foobar.sh # copies foobar.sh into the container and runs it as root
---podman-arg   ARG         # passes ARG straight through to podman (repeatable)
+--podman-arg   ARG         # passes ARG to podman run as ONE argument (repeatable)
 ```
 
 Neither image includes `git`, so a common one is:
@@ -185,7 +192,7 @@ able to troubleshoot it:
 ```sh
 claude-podman \
 	--apk-packages kubectl \
-	--podman-arg "-v $HOME/.kube/config:/home/claude/.kube/config"
+	--podman-arg "--volume=$HOME/.kube/config:/home/claude/.kube/config:ro"
 ```
 
 The same for codex — note the different home directory inside the container:
@@ -193,7 +200,7 @@ The same for codex — note the different home directory inside the container:
 ```sh
 codex-podman \
 	--apk-packages kubectl \
-	--podman-arg "-v $HOME/.kube/config:/home/codex/.kube/config"
+	--podman-arg "--volume=$HOME/.kube/config:/home/codex/.kube/config:ro"
 ```
 
 See `examples/init.sh` for an `--init-script` template.
@@ -206,7 +213,7 @@ Options
 | `--local` | ✓ | ✓ | Use the locally built image instead of pulling from ghcr.io |
 | `--apk-packages LIST` | ✓ | ✓ | Install extra Alpine packages (comma or space separated) |
 | `--init-script FILE` | ✓ | ✓ | Copy FILE into the container and run it as root |
-| `--podman-arg ARG` | ✓ | ✓ | Pass an extra argument to `podman run` (repeatable) |
+| `--podman-arg ARG` | ✓ | ✓ | Pass one extra argument to `podman run` (repeatable; use `--flag=value` forms) |
 | `--self-update` | ✓ | ✓ | Replace the installed launcher with the latest from GitHub |
 | `--help` | ✓ | ✓ | Show usage |
 | `--sandboxed` | | ✓ | Keep codex's own sandbox instead of relying on the container |
@@ -214,6 +221,19 @@ Options
 
 Launcher options must come first: the first unrecognized argument, and
 everything after it, is forwarded to the agent itself.
+
+Each `--podman-arg` is passed as exactly one argument, so paths with spaces
+work, but `"-v a:b"` does not. Write `"--volume=a:b"` or repeat the option
+(`--podman-arg -v --podman-arg a:b`).
+
+Packages and `--init-script` are installed before the agent starts, and a
+failure stops the launch. The container is removed when the agent exits,
+you close the terminal, or you press Ctrl-C during setup. Without a terminal,
+the launchers run the agent non-interactively, so pipes work:
+
+```sh
+git diff | claude-podman -p "review this diff"
+```
 
 Building locally
 ----
