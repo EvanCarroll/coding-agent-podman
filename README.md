@@ -83,7 +83,31 @@ Signing in
 ----
 
 **Claude Code** stores its credentials in `$HOME/.claude.json` and
-`$HOME/.claude`, both of which are mounted, so signing in once persists.
+`$HOME/.claude`, both of which are mounted, so signing in once persists. There
+is no browser in the container, so `/login` falls back to printing a URL and
+asking you to paste back the code the site gives you. That works everywhere,
+but if you'd rather get the normal "browser opens, login completes" flow:
+
+```sh
+# Option 1: log in once on the host (run claude, then /login). The token
+# lands in ~/.claude/.credentials.json, which the container mounts.
+claude
+
+# Option 2: paste the code. No flags needed; works on remote/headless hosts.
+claude-podman
+
+# Option 3: open the URL in your host browser and route the OAuth callback back
+# into the container. Requires pasta (podman's default since 5.0).
+claude-podman --login
+```
+
+`--login` is more involved than codex's, because claude's callback server
+listens on a *random* port. The launcher sets `$BROWSER` in the container to a
+script that hands the URL to the host, which opens it with `xdg-open` (or
+prints it if there's no `xdg-open`), and runs pasta with `-t auto` so whatever
+port claude binds is forwarded from the host. That forwards *every* port the
+container listens on, on all of the host's IPv4 addresses, and turns IPv6 off
+for the session, so use `--login` to log in and then restart without it.
 
 **Codex** is slightly awkward the first time. `codex login` starts a server on
 `localhost:1455` and waits for your browser to deliver an OAuth callback to it.
@@ -186,7 +210,7 @@ Options
 | `--self-update` | ✓ | ✓ | Replace the installed launcher with the latest from GitHub |
 | `--help` | ✓ | ✓ | Show usage |
 | `--sandboxed` | | ✓ | Keep codex's own sandbox instead of relying on the container |
-| `--login` | | ✓ | Route port 1455 into the container's loopback so `codex login` can receive its browser callback |
+| `--login` | ✓ | ✓ | Make browser OAuth login work: codex's fixed port 1455, or for Claude, open the URL on the host and forward its random callback port |
 
 Launcher options must come first: the first unrecognized argument, and
 everything after it, is forwarded to the agent itself.

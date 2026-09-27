@@ -6,6 +6,7 @@ NAME="claudecode-$(uuidgen -r | cut -d- -f1)"
 INIT_SCRIPT=""
 APK_PACKAGES=""
 PODMAN_ARGS=""
+LOGIN=""
 
 # Process arguments
 while [[ $# -gt 0 ]]; do
@@ -18,6 +19,9 @@ while [[ $# -gt 0 ]]; do
 
 			Options:
 			  --local              Use local image 'claude-code:latest' instead of remote
+			  --login              Make '/login' work in your browser: open its URL on
+			                       the host and route the OAuth callback back into the
+			                       container (needs pasta; without it, paste the code)
 			  --init-script FILE   Execute initialization script as root in the container
 			  --apk-packages LIST  Install additional Alpine packages (comma or space separated)
 			  --podman-arg ARG     Pass additional argument to podman
@@ -39,6 +43,19 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--local)
 		IMAGE="claude-code:latest"
+		shift
+		;;
+	--login)
+		# claude's OAuth callback server listens on a *random* port on
+		# 127.0.0.1 inside the container, so a fixed -p (as codex-podman uses)
+		# can't work. pasta's "-t auto" forwards whatever port gets bound, and
+		# --host-lo-to-ns-lo lands it on the container's loopback, where the
+		# listener is. -4 matters: with IPv6 on, the browser's "localhost"
+		# goes to ::1, which pasta accepts and then resets, and it never falls
+		# back to 127.0.0.1. "auto" forwards every port the container binds
+		# for the whole session, so only use --login to log in.
+		LOGIN=1
+		PODMAN_ARGS="$PODMAN_ARGS --network=pasta:-4,-t,auto,--host-lo-to-ns-lo"
 		shift
 		;;
 	--init-script)
@@ -63,6 +80,30 @@ done
 # breaks claude on a fresh machine.
 mkdir -p "${HOME}/.claude"
 [ -e "${HOME}/.claude.json" ] || echo '{}' >"${HOME}/.claude.json"
+
+# There is no browser in the container, so claude's $BROWSER hands the login
+# URL to a file in a shared directory and the host opens it.
+if [ -n "$LOGIN" ]; then
+	LOGIN_DIR=$(mktemp -d)
+	cat >"$LOGIN_DIR/open" <<-'EOT'
+		#!/bin/sh
+		printf '%s\n' "$1" >>/run/claude-login/url
+	EOT
+	chmod 755 "$LOGIN_DIR/open"
+	(
+		while sleep 1; do
+			[ -s "$LOGIN_DIR/url" ] || continue
+			mv "$LOGIN_DIR/url" "$LOGIN_DIR/url.seen"
+			while read -r url; do
+				xdg-open "$url" >/dev/null 2>&1 ||
+					printf '\nOpen this URL in your browser:\n%s\n' "$url" >&2
+			done <"$LOGIN_DIR/url.seen"
+		done
+	) &
+	LOGIN_WATCHER=$!
+	trap 'kill "$LOGIN_WATCHER" 2>/dev/null; rm -rf "$LOGIN_DIR"' EXIT
+	PODMAN_ARGS="$PODMAN_ARGS -v $LOGIN_DIR:/run/claude-login -e BROWSER=/run/claude-login/open"
+fi
 
 podman run \
 	-v "${HOME}/.claude:/home/claude/.claude" \
