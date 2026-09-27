@@ -1,0 +1,33 @@
+# Rust nightly (plus git, ssh and ripgrep) under the agent images. Use it in
+# place:
+#
+#   make images CONTAINERFILE=examples/Containerfile.rust-nightly
+#
+# or copy it to ./Containerfile (gitignored), which a plain `make images` picks
+# up. Then run `claude-podman --local` or `codex-podman --local`.
+#
+# BASE_IMAGE is filled in by the build scripts with each agent's usual Alpine
+# base, so this one file serves both. The agent is installed on top of it, so
+# keep it Alpine and don't add users: the agents claim uids 1000 and 1001.
+#
+# Anything the agent installs at run time is gone when its container exits, so
+# bake in what your projects pin: a dated nightly from rust-toolchain.toml, or
+# targets such as `rustup target add wasm32-unknown-unknown`.
+#
+# rustup's musl toolchain links statically, so crates that link a C library
+# need its static archive as well, e.g. openssl-libs-static.
+
+ARG BASE_IMAGE=docker.io/alpine:latest
+FROM ${BASE_IMAGE}
+
+# RUSTUP_HOME stays set so the proxies find the toolchain, and writable so the
+# agent can still add a toolchain or target a project asks for. CARGO_HOME is
+# only for the install: at run time cargo uses the agent's own ~/.cargo, and
+# the proxies are reached through /usr/local/bin. build-base supplies the cc
+# that rustc links with.
+ENV RUSTUP_HOME=/usr/local/rustup
+RUN apk add --no-cache build-base git openssh-client ripgrep rustup \
+	&& CARGO_HOME=/usr/local/cargo rustup-init -y --no-modify-path \
+		--default-toolchain nightly --profile minimal -c clippy -c rustfmt \
+	&& ln -s /usr/local/cargo/bin/* /usr/local/bin/ \
+	&& chmod -R a+w "$RUSTUP_HOME"

@@ -203,7 +203,10 @@ codex-podman \
 	--podman-arg "--volume=$HOME/.kube/config:/home/codex/.kube/config:ro"
 ```
 
-See `examples/init.sh` for an `--init-script` template.
+See `examples/init.sh` for an `--init-script` template. Packages are
+installed and init scripts run on every start, so for anything heavy, like a
+language toolchain, bake it into the image instead; see
+[Customizing the image](#customizing-the-image).
 
 Options
 ----
@@ -238,19 +241,68 @@ git diff | claude-podman -p "review this diff"
 Building locally
 ----
 
-Images are built with [buildah](https://buildah.io/) — there is no Containerfile.
+Images are built by [buildah](https://buildah.io/) scripts, not from a
+Containerfile. From a clone:
 
 ```sh
-./devops/build-claude.sh   # prints claude-code:<version>
-./devops/build-codex.sh    # prints codex:<version>
+make images   # or make image-claude / make image-codex
 ```
 
-Each script prints exactly one line on stdout (the image reference) so CI can
-consume it; all other output goes to stderr. Then run against the local build:
+That runs `./devops/build-claude.sh` and `./devops/build-codex.sh`, which you
+can also run directly. Each prints exactly one line on stdout (the image
+reference, e.g. `claude-code:<version>`) so CI can consume it; all other output
+goes to stderr. Then run against the local build:
 
 ```sh
 claude-podman --local
 codex-podman --local
+```
+
+### Customizing the image
+
+`--apk-packages` and `--init-script` run on every start, which is fine for a
+package or two but far too slow for a toolchain. To bake one in, layer a
+Containerfile of your own under the images. For example, Rust nightly:
+
+```sh
+make images CONTAINERFILE=examples/Containerfile.rust-nightly
+claude-podman --local
+```
+
+Copy it to `./Containerfile` (gitignored, so it stays yours) and a plain
+`make images` picks it up; `make images CONTAINERFILE=` builds the stock images
+again. Start your own with:
+
+```containerfile
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+```
+
+The build fills in each agent's usual Alpine base (`node:current-alpine` for
+Claude Code, `alpine:latest` for Codex), so one file serves both. The agent is
+installed on top, so keep it Alpine and don't add users; the agents claim uids
+1000 and 1001. A hardcoded `FROM` works too, but then that base has to meet
+those needs itself, including npm for Claude Code.
+
+The build scripts read the same settings from the environment, and CI sets
+none of them:
+
+| Variable | Effect |
+| --- | --- |
+| `BASE_IMAGE` | Build on this image instead of the agent's usual base |
+| `CONTAINERFILE` | Build this file on `BASE_IMAGE` first, then the agent on the result |
+| `NO_CACHE=1` | Rebuild the Containerfile from scratch; its steps are otherwise cached for up to a week |
+
+A custom build replaces your local `claude-code:latest` / `codex:latest`, so
+`--local` runs whichever you built last.
+
+Cargo's download cache lives in the container and goes when it does. To keep
+it between sessions, give it a named volume rather than mounting your own
+`~/.cargo`, which holds your crates.io token and binaries your host runs (for
+codex, the path is `/home/codex/.cargo`):
+
+```sh
+claude-podman --local --podman-arg "--volume=cargo-home:/home/claude/.cargo:U"
 ```
 
 License
