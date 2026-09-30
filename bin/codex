@@ -10,11 +10,13 @@ INIT_SCRIPT=""
 APK_PACKAGES=""
 PODMAN_ARGS=()
 
-# The container is the security boundary, so codex's own landlock sandbox is
-# off by default -- it is redundant here and frequently fails to initialize
-# under rootless podman. --sandboxed puts it back in charge.
+# By default codex keeps its own sandbox inside the container: writes are
+# confined to the workspace, the network is off, and anything else asks for
+# approval, the same as claude-podman without --yolo. These are codex's own
+# defaults, spelled out because any -c keeps codex off its background server,
+# which can't start under podman. --yolo drops the sandbox and the prompts.
 # The inner quotes are literal: codex parses -c key=value as TOML.
-CODEX_ARGS=(-c 'sandbox_mode="danger-full-access"' -c 'approval_policy="never"')
+CODEX_ARGS=(-c 'sandbox_mode="workspace-write"' -c 'approval_policy="on-request"')
 
 die() {
 	printf '%s: %s\n' "${0##*/}" "$*" >&2
@@ -36,8 +38,8 @@ while [[ $# -gt 0 ]]; do
 
 			Options:
 			  --local              Use local image 'codex:latest' instead of remote
-			  --sandboxed          Keep codex's own sandbox instead of relying on the
-			                       container boundary (often fails under rootless podman)
+			  --yolo               No sandbox inside the container and no approval
+			                       prompts: the container is the only boundary
 			  --login              Make 'codex login' work: publish port 1455 and route
 			                       it to the container's loopback, where codex listens
 			                       (needs pasta; no-port alternative: login --device-auth)
@@ -65,8 +67,8 @@ while [[ $# -gt 0 ]]; do
 		PULL=never
 		shift
 		;;
-	--sandboxed)
-		CODEX_ARGS=()
+	--yolo)
+		CODEX_ARGS=(-c 'sandbox_mode="danger-full-access"' -c 'approval_policy="never"')
 		shift
 		;;
 	--login)
@@ -106,6 +108,28 @@ command -v podman >/dev/null || die "podman is not installed"
 
 # Podman would create this as a root-owned directory if it doesn't exist yet.
 mkdir -p "${HOME}/.codex"
+
+# ~/.codex is writable, but these parts of it are what the host's own codex
+# runs code from (notify, MCP servers, hook trust, execpolicy rules) or takes
+# orders from. Left writable, the agent could plant something that runs outside
+# the container the next time you use codex on the host, so they are mounted
+# read-only over the top. Missing ones are created first, or the agent could
+# simply create them. Project trust and settings are changed on the host.
+touch "${HOME}/.codex/config.toml" "${HOME}/.codex/AGENTS.md"
+mkdir -p "${HOME}/.codex/rules"
+for p in config.toml AGENTS.md rules; do
+	PODMAN_ARGS+=(-v "${HOME}/.codex/$p:/home/codex/.codex/$p:ro")
+done
+
+# codex won't start in a folder it hasn't been told to trust, and it can't
+# save that answer to the read-only config.toml, so running codex-podman here
+# counts as the answer. It's recorded on the host just as codex would.
+TRUST_KEY=${PWD//\\/\\\\}
+TRUST_KEY="[projects.\"${TRUST_KEY//\"/\\\"}\"]"
+if ! grep -qF "$TRUST_KEY" "${HOME}/.codex/config.toml"; then
+	printf '\n%s\ntrust_level = "trusted"\n' "$TRUST_KEY" >>"${HOME}/.codex/config.toml"
+	printf '%s: trusting %s in ~/.codex/config.toml\n' "${0##*/}" "$PWD" >&2
+fi
 
 # The host's git identity and aliases, read-only so the agent can't rewrite
 # them. Credential helpers it names won't exist in the container, which is

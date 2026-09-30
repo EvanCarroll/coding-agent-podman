@@ -12,6 +12,7 @@ PODMAN_ARGS=()
 LOGIN=""
 LOGIN_DIR=""
 LOGIN_WATCHER=""
+CLAUDE_ARGS=()
 
 die() {
 	printf '%s: %s\n' "${0##*/}" "$*" >&2
@@ -33,6 +34,8 @@ while [[ $# -gt 0 ]]; do
 
 			Options:
 			  --local              Use local image 'claude-code:latest' instead of remote
+			  --yolo               Run claude with --dangerously-skip-permissions: no
+			                       prompts, the container is the only boundary
 			  --login              Make '/login' work in your browser: open its URL on
 			                       the host and route the OAuth callback back into the
 			                       container (needs pasta; without it, paste the code)
@@ -58,6 +61,14 @@ while [[ $# -gt 0 ]]; do
 	--local)
 		IMAGE="claude-code:latest"
 		PULL=never
+		shift
+		;;
+	--yolo)
+		# Accepting claude's one-time bypass warning is saved to settings.json,
+		# which is read-only in here, so it would come back every run. Asking
+		# for --yolo is the acceptance.
+		CLAUDE_ARGS=(--dangerously-skip-permissions
+			--settings '{"skipDangerousModePermissionPrompt":true}')
 		shift
 		;;
 	--login)
@@ -101,6 +112,19 @@ command -v podman >/dev/null || die "podman is not installed"
 # breaks claude on a fresh machine.
 mkdir -p "${HOME}/.claude"
 [ -e "${HOME}/.claude.json" ] || echo '{}' >"${HOME}/.claude.json"
+
+# ~/.claude is writable, but these parts of it are what the host's own claude
+# runs code from (hooks, statusLine, MCP servers, plugins) or takes orders from.
+# Left writable, the agent could plant something that runs outside the
+# container the next time you use claude on the host, so they are mounted
+# read-only over the top. Missing ones are created first, or the agent could
+# simply create them. Plugins and settings are changed on the host.
+[ -e "${HOME}/.claude/settings.json" ] || echo '{}' >"${HOME}/.claude/settings.json"
+touch "${HOME}/.claude/CLAUDE.md"
+mkdir -p "${HOME}/.claude/"{plugins,agents,commands,skills}
+for p in settings.json CLAUDE.md plugins agents commands skills; do
+	PODMAN_ARGS+=(-v "${HOME}/.claude/$p:/home/claude/.claude/$p:ro")
+done
 
 # The host's git identity and aliases, read-only so the agent can't rewrite
 # them. Credential helpers it names won't exist in the container, which is
@@ -201,7 +225,7 @@ podman exec -i "${TTY[@]}" \
 	--user claude \
 	-w "$PWD" \
 	-e TERM -e COLORTERM -e LANG \
-	"$NAME" claude "$@" <&3 3<&- &
+	"$NAME" claude "${CLAUDE_ARGS[@]}" "$@" <&3 3<&- &
 rc=0
 wait $! || rc=$?
 exit "$rc"

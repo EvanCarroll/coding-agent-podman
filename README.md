@@ -68,6 +68,7 @@ The agent only gets file access to:
 | --- | --- | --- |
 | Working directory | `$PWD` | `$PWD` |
 | Credentials + config | `$HOME/.claude`, `$HOME/.claude.json` | `$HOME/.codex` |
+| Agent config (read-only) | `settings.json`, `CLAUDE.md`, `plugins/`, `agents/`, `commands/`, `skills/` under `~/.claude` | `config.toml`, `AGENTS.md`, `rules/` under `~/.codex` |
 | Git config (read-only) | `~/.gitconfig`, `~/.config/git/config` | `~/.gitconfig`, `~/.config/git/config` |
 
 Everything else in your home directory — SSH keys, cloud credentials, browser
@@ -82,6 +83,27 @@ they can't even update themselves.
 The git config is there so commits carry your name and aliases work. It's
 mounted read-only, and any credential helpers it names (`gh`, `glab`, …) don't
 exist in the container, so the agent has no git credentials.
+
+The agent config is read-only because it's what the agent on your *host* runs
+code from (hooks, status lines, MCP servers, plugins, codex's `notify` and
+execpolicy rules) or takes instructions from. If it were writable, an agent in
+the container could plant something that runs outside the container the next
+time you use `claude` or `codex` directly. The rest of `~/.claude` and `~/.codex`
+(credentials, history, sessions) stays writable. Missing files and directories
+in that list are created empty on first run, so the agent can't create them
+either. The effect: change settings, install plugins and edit `CLAUDE.md` /
+`AGENTS.md` on the host, not from inside the container. Codex can't save its
+"trust this folder" answer to a read-only `config.toml`, so `codex-podman`
+records that trust itself when it starts in a new folder.
+
+What is still writable and can reach the host:
+
+- `~/.claude.json` holds Claude Code's user and per-project `mcpServers`, and
+  Claude rewrites the file constantly, so it can't be made read-only.
+- `$PWD` is your project. `.git/hooks`, `.git/config`, `.claude/`, `.codex/`,
+  `.mcp.json`, `.envrc`, `Makefile` and the like are all writable, and all run
+  on the host later. Review the diff before running anything in it outside the
+  container.
 
 Neither image ships `git` — see [Customizing the runtime](#customizing-the-runtime)
 if you want it.
@@ -147,26 +169,38 @@ codex-podman --podman-arg "--env=OPENAI_API_KEY=$OPENAI_API_KEY"
 Sandboxing
 ----
 
-Codex ships its own OS-level sandbox (landlock/seccomp). Inside podman that is
-redundant — the container is already the boundary — and it frequently fails to
-initialize under rootless podman. So `codex-podman` turns it off by default:
+By default both agents still ask before doing anything risky, as they do outside
+a container. `--yolo` turns that off for either one.
 
-```sh
-codex -c sandbox_mode="danger-full-access" -c approval_policy="never"
-```
+| | Claude default | Claude `--yolo` | Codex default | Codex `--yolo` |
+| --- | --- | --- | --- | --- |
+| Passed to the agent | nothing | `--dangerously-skip-permissions --settings '{"skipDangerousModePermissionPrompt":true}'` | `-c sandbox_mode="workspace-write" -c approval_policy="on-request"` | `-c sandbox_mode="danger-full-access" -c approval_policy="never"` |
+| What holds it back | permission prompts | nothing but the container | codex's sandbox (bubblewrap), prompts to leave it | nothing but the container |
+| Edits in `$PWD` | asks | allowed | allowed | allowed |
+| Shell commands | read-only ones run, the rest ask | allowed | run inside the sandbox | allowed |
+| Writes elsewhere in the container | asks | allowed | asks | allowed |
+| Network | allowed once the command or fetch is approved | allowed | asks | allowed |
+| "Don't ask again" | saved to `$PWD/.claude/settings.local.json`, so your host claude also honors it | n/a | this session only (`~/.codex/rules/` is read-only) | n/a |
 
-This is the posture OpenAI recommends *specifically* for containerized use. It
-means codex will not prompt for approval and can write anywhere **inside the
-container**, which is still only `$PWD` and `~/.codex` on your actual disk.
+The two defaults differ in how they hold the agent back. Claude asks before each
+action and has no sandbox, so once you approve a command it can do anything the
+container allows, network included. Codex runs commands without asking but
+inside its sandbox, and asks only when a command needs to leave it: to write
+outside the workspace or reach the network. Your own settings still apply on
+top: a `permissions` block or `defaultMode` in `~/.claude/settings.json` changes
+what Claude asks about.
 
-If you'd rather keep codex's internal sandbox as a second layer, pass
-`--sandboxed` and it injects nothing:
+The two `--yolo` modes end up the same: no prompts, no sandbox inside the
+container, full network. The difference is only what gets switched off. Claude
+never had a sandbox, so `--yolo` just drops its prompts, and the launcher also
+skips its one-time warning dialog. Codex loses its sandbox and its prompts. In
+both, the container is the only boundary, and whatever stays writable (see
+[Benefits](#benefits): `$PWD`, `~/.claude.json`, the rest of `~/.codex`) is
+open to the agent without a prompt.
 
-```sh
-codex-podman --sandboxed
-```
-
-Claude Code has no equivalent flag; it is confined by the container alone.
+`codex-podman` passes codex's defaults explicitly even though codex would pick
+them anyway: without any `-c`, codex starts a background server, which can't
+run under podman.
 
 Customizing the runtime
 ----
@@ -219,7 +253,7 @@ Options
 | `--podman-arg ARG` | ✓ | ✓ | Pass one extra argument to `podman run` (repeatable; use `--flag=value` forms) |
 | `--self-update` | ✓ | ✓ | Replace the installed launcher with the latest from GitHub |
 | `--help` | ✓ | ✓ | Show usage |
-| `--sandboxed` | | ✓ | Keep codex's own sandbox instead of relying on the container |
+| `--yolo` | ✓ | ✓ | No permission prompts; for codex, also no sandbox inside the container |
 | `--login` | ✓ | ✓ | Make browser OAuth login work: codex's fixed port 1455, or for Claude, open the URL on the host and forward its random callback port |
 
 Launcher options must come first: the first unrecognized argument, and
